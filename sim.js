@@ -1,13 +1,15 @@
-// sim.js — FULL working file (v3.1)
+// sim.js — FULL working file (v3.2)
+// Browser + GitHub Pages friendly ecosystem sim
 // ✅ Plants -> Grazers -> Hunters
-// ✅ Size gene + mutation + speciation (auto color + name)
-// ✅ Legend panel (click species to follow)
-// ✅ Optional labels only when zoomed in
-// ✅ 3 save slots (World 1/2/3) stored in localStorage
+// ✅ Slow-paced (tickEvery slider), no “max out forever” (density pressure)
+// ✅ Genes include SIZE (different sizes)
+// ✅ Speciation: auto species names + colors
+// ✅ Legend panel: color + name + count (click to follow species)
+// ✅ Optional labels above organisms (only when zoomed in)
+// ✅ Infinite zoom + pan (wheel + drag) + follow camera
+// ✅ Autosave + 3 save slots (World 1/2/3) in localStorage
 // ✅ Export / Import world (.json)
-// ✅ Autosave (settings + world) to selected slot
-//
-// IMPORTANT FIX: frameCounter is declared at the TOP (global) so it can never be “not defined”.
+// ✅ NEW: If hunters die, one hunter “comes from a grazer baby” every 60 seconds (real time)
 
 // ---------------- DOM ----------------
 const canvas = document.getElementById("c");
@@ -66,8 +68,10 @@ const dist2 = (ax, ay, bx, by) => (ax - bx) ** 2 + (ay - by) ** 2;
 
 function wrapPos(o) {
   const w = W(), h = H();
-  if (o.x < 0) o.x += w; else if (o.x > w) o.x -= w;
-  if (o.y < 0) o.y += h; else if (o.y > h) o.y -= h;
+  if (o.x < 0) o.x += w;
+  else if (o.x > w) o.x -= w;
+  if (o.y < 0) o.y += h;
+  else if (o.y > h) o.y -= h;
 }
 
 function downloadTextFile(filename, text) {
@@ -82,17 +86,19 @@ function downloadTextFile(filename, text) {
   URL.revokeObjectURL(url);
 }
 
-// ---------------- GLOBAL SIM STATE (FIXED) ----------------
+// ---------------- GLOBAL SIM STATE ----------------
 let ticks = 0;
 let paused = false;
-let frameCounter = 0; // ✅ ALWAYS defined globally
-
+let frameCounter = 0; // IMPORTANT: global so it can’t “not defined”
 let lastLegendUpdateTick = 0;
 let lastSaveTime = 0;
 
+// NEW: spawn 1 hunter every 60 seconds from a grazer “baby”
+let lastHybridHunterSpawn = performance.now();
+
 // ---------------- Settings ----------------
-const SETTINGS_KEY = "ecosim_settings_v31";
-const WORLD_KEY_BASE = "ecosim_world_v31_slot_"; // + slot number
+const SETTINGS_KEY = "ecosim_settings_v32";
+const WORLD_KEY_BASE = "ecosim_world_v32_slot_"; // + slot number
 
 const defaults = {
   tickEvery: 2,
@@ -184,7 +190,9 @@ bindSettingHandlers();
 
 // ---------------- Save slot ----------------
 let currentSlot = parseInt(slotSelect.value, 10) || 1;
-function worldKey() { return WORLD_KEY_BASE + currentSlot; }
+function worldKey() {
+  return WORLD_KEY_BASE + currentSlot;
+}
 
 // ---------------- Camera (infinite zoom/pan) ----------------
 const cam = { x: 0, y: 0, scale: 1.0 };
@@ -195,30 +203,44 @@ function resetView() {
   cam.scale = 1.0;
 }
 resetViewBtn.addEventListener("click", resetView);
-canvas.addEventListener("dblclick", (e) => { e.preventDefault(); resetView(); });
+canvas.addEventListener("dblclick", (e) => {
+  e.preventDefault();
+  resetView();
+});
 
 function screenToWorld(sx, sy) {
-  const cx = W() / 2, cy = H() / 2;
+  const cx = W() / 2,
+    cy = H() / 2;
   return { x: cam.x + (sx - cx) / cam.scale, y: cam.y + (sy - cy) / cam.scale };
 }
 
-canvas.addEventListener("wheel", (e) => {
-  e.preventDefault();
-  const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+canvas.addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
 
-  const before = screenToWorld(mx, my);
-  const factor = Math.pow(1.0015, -e.deltaY);
-  cam.scale = clamp(cam.scale * factor, 0.00001, 1e9);
-  const after = screenToWorld(mx, my);
+    const before = screenToWorld(mx, my);
+    const factor = Math.pow(1.0015, -e.deltaY);
+    cam.scale = clamp(cam.scale * factor, 0.00001, 1e9);
+    const after = screenToWorld(mx, my);
 
-  cam.x += before.x - after.x;
-  cam.y += before.y - after.y;
-}, { passive: false });
+    cam.x += before.x - after.x;
+    cam.y += before.y - after.y;
+  },
+  { passive: false }
+);
 
-let dragging = false, lastX = 0, lastY = 0;
-canvas.addEventListener("mousedown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+let dragging = false,
+  lastX = 0,
+  lastY = 0;
+canvas.addEventListener("mousedown", (e) => {
+  dragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+});
 window.addEventListener("mouseup", () => (dragging = false));
 window.addEventListener("mousemove", (e) => {
   if (!dragging) return;
@@ -239,21 +261,28 @@ let plant = new Float32Array(GRID * GRID);
 const idx = (ix, iy) => iy * GRID + ix;
 
 function samplePlant(x, y) {
-  const w = W(), h = H();
+  const w = W(),
+    h = H();
   const gx = clamp((x / w) * GRID, 0, GRID - 1e-6);
   const gy = clamp((y / h) * GRID, 0, GRID - 1e-6);
-  const x0 = Math.floor(gx), y0 = Math.floor(gy);
-  const x1 = Math.min(GRID - 1, x0 + 1), y1 = Math.min(GRID - 1, y0 + 1);
-  const tx = gx - x0, ty = gy - y0;
-  const a = plant[idx(x0, y0)], b = plant[idx(x1, y0)];
-  const c = plant[idx(x0, y1)], d = plant[idx(x1, y1)];
+  const x0 = Math.floor(gx),
+    y0 = Math.floor(gy);
+  const x1 = Math.min(GRID - 1, x0 + 1),
+    y1 = Math.min(GRID - 1, y0 + 1);
+  const tx = gx - x0,
+    ty = gy - y0;
+  const a = plant[idx(x0, y0)],
+    b = plant[idx(x1, y0)];
+  const c = plant[idx(x0, y1)],
+    d = plant[idx(x1, y1)];
   const ab = a + (b - a) * tx;
   const cd = c + (d - c) * tx;
   return ab + (cd - ab) * ty;
 }
 
 function addPlant(x, y, amount) {
-  const w = W(), h = H();
+  const w = W(),
+    h = H();
   const ix0 = clamp(Math.floor((x / w) * GRID), 0, GRID - 1);
   const iy0 = clamp(Math.floor((y / h) * GRID), 0, GRID - 1);
   const k = idx(ix0, iy0);
@@ -261,7 +290,8 @@ function addPlant(x, y, amount) {
 }
 
 function eatPlantAt(x, y, amount) {
-  const w = W(), h = H();
+  const w = W(),
+    h = H();
   const ix0 = clamp(Math.floor((x / w) * GRID), 0, GRID - 1);
   const iy0 = clamp(Math.floor((y / h) * GRID), 0, GRID - 1);
   const k = idx(ix0, iy0);
@@ -304,9 +334,12 @@ const START_HUNTERS = 1;
 const TARGET_GRAZERS = 120;
 const TARGET_HUNTERS = 55;
 
-function sigmoid01(x) { return 1 / (1 + Math.exp(-x)); }
+function sigmoid01(x) {
+  return 1 / (1 + Math.exp(-x));
+}
 function densityPressure() {
-  const g = grazers.length, h = hunters.length;
+  const g = grazers.length,
+    h = hunters.length;
   const gP = sigmoid01((g - TARGET_GRAZERS) / 25);
   const hP = sigmoid01((h - TARGET_HUNTERS) / 18);
   return clamp(0.55 * gP + 0.45 * hP, 0, 1);
@@ -318,8 +351,8 @@ const preyAbundant = () => grazers.length > Math.max(18, hunters.length * 1.6);
 let nextSpeciesId = 1;
 const speciesDB = new Map();
 
-const syllA = ["ka","zu","mi","ra","to","shi","na","lo","ve","xi","qu","ha","yo","ti","sa","no"];
-const syllB = ["rin","mar","tuk","ven","sol","fer","lan","koi","zen","dor","pik","moi","tes","vex"];
+const syllA = ["ka", "zu", "mi", "ra", "to", "shi", "na", "lo", "ve", "xi", "qu", "ha", "yo", "ti", "sa", "no"];
+const syllB = ["rin", "mar", "tuk", "ven", "sol", "fer", "lan", "koi", "zen", "dor", "pik", "moi", "tes", "vex"];
 
 function makeName(type) {
   const a = syllA[Math.floor(Math.random() * syllA.length)];
@@ -332,14 +365,35 @@ function hsvToRgbString(hDeg, s, v) {
   const c = v * s;
   const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
   const m = v - c;
-  let r = 0, g = 0, b = 0;
-  if (h < 60) { r = c; g = x; b = 0; }
-  else if (h < 120) { r = x; g = c; b = 0; }
-  else if (h < 180) { r = 0; g = c; b = x; }
-  else if (h < 240) { r = 0; g = x; b = c; }
-  else if (h < 300) { r = x; g = 0; b = c; }
-  else { r = c; g = 0; b = x; }
-  return `rgb(${Math.floor((r+m)*255)}, ${Math.floor((g+m)*255)}, ${Math.floor((b+m)*255)})`;
+  let r = 0,
+    g = 0,
+    b = 0;
+  if (h < 60) {
+    r = c;
+    g = x;
+    b = 0;
+  } else if (h < 120) {
+    r = x;
+    g = c;
+    b = 0;
+  } else if (h < 180) {
+    r = 0;
+    g = c;
+    b = x;
+  } else if (h < 240) {
+    r = 0;
+    g = x;
+    b = c;
+  } else if (h < 300) {
+    r = x;
+    g = 0;
+    b = c;
+  } else {
+    r = c;
+    g = 0;
+    b = x;
+  }
+  return `rgb(${Math.floor((r + m) * 255)}, ${Math.floor((g + m) * 255)}, ${Math.floor((b + m) * 255)})`;
 }
 
 function makeColor(type) {
@@ -349,32 +403,42 @@ function makeColor(type) {
   return hsvToRgbString(h, s, v);
 }
 
-function geneVector(g) { return [g.speed, g.turn, g.greed, g.caution, g.bite, g.size]; }
+function geneVector(g) {
+  return [g.speed, g.turn, g.greed, g.caution, g.bite, g.size];
+}
 function vecDist(a, b) {
   let s = 0;
-  for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d*d; }
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    s += d * d;
+  }
   return Math.sqrt(s);
 }
 
 function createSpecies(type, fromGenesVec, tickNow) {
   const id = nextSpeciesId++;
   speciesDB.set(id, {
-    id, type,
+    id,
+    type,
     name: makeName(type),
     color: makeColor(type),
     count: 0,
     centroid: fromGenesVec.slice(),
-    createdTick: tickNow
+    createdTick: tickNow,
   });
   return id;
 }
 
 function findNearestSpeciesId(type, genesVec) {
-  let bestId = null, bestD = Infinity;
+  let bestId = null,
+    bestD = Infinity;
   for (const sp of speciesDB.values()) {
     if (sp.type !== type) continue;
     const d = vecDist(genesVec, sp.centroid);
-    if (d < bestD) { bestD = d; bestId = sp.id; }
+    if (d < bestD) {
+      bestD = d;
+      bestId = sp.id;
+    }
   }
   return { bestId, bestD };
 }
@@ -424,21 +488,25 @@ function updateSpeciesStats() {
 class Agent {
   constructor(type, x, y, genes, speciesId = null) {
     this.type = type;
-    this.x = x; this.y = y;
-    this.vx = 0; this.vy = 0;
+    this.x = x;
+    this.y = y;
+    this.vx = 0;
+    this.vy = 0;
     this.a = rand(Math.PI * 2);
     this.energy = 0.95;
     this.age = 0;
     this.reproCooldown = 0;
 
-    this.g = genes ?? {
-      speed: rand(0.60, 0.20),
-      turn: rand(0.55, 0.20),
-      greed: rand(0.70, 0.20),
-      caution: rand(0.55, 0.12),
-      bite: rand(0.60, 0.20),
-      size: rand(0.30, 0.10),
-    };
+    this.g =
+      genes ??
+      {
+        speed: rand(0.60, 0.20),
+        turn: rand(0.55, 0.20),
+        greed: rand(0.70, 0.20),
+        caution: rand(0.55, 0.12),
+        bite: rand(0.60, 0.20),
+        size: rand(0.30, 0.10),
+      };
 
     this.speciesId = speciesId;
   }
@@ -452,14 +520,7 @@ class Agent {
       }
     }
     const babySp = assignSpeciesAtBirth(this.type, geneVector(ng), this.speciesId, ticks);
-
-    const baby = new Agent(
-      this.type,
-      this.x + rand(12, -12),
-      this.y + rand(12, -12),
-      ng,
-      babySp
-    );
+    const baby = new Agent(this.type, this.x + rand(12, -12), this.y + rand(12, -12), ng, babySp);
     baby.energy = 0.65;
     baby.a = rand(Math.PI * 2);
     baby.reproCooldown = REPRO_COOLDOWN_TICKS;
@@ -548,7 +609,9 @@ function renderLegend() {
 }
 
 function speciesCenter(speciesId) {
-  let sx = 0, sy = 0, n = 0;
+  let sx = 0,
+    sy = 0,
+    n = 0;
   for (const a of grazers) if (a.speciesId === speciesId) { sx += a.x; sy += a.y; n++; }
   for (const a of hunters) if (a.speciesId === speciesId) { sx += a.x; sy += a.y; n++; }
   if (!n) return null;
@@ -564,7 +627,7 @@ function followCamera() {
   cam.y = cam.y + (c.y - cam.y) * t;
 }
 
-// ---------------- Behavior ----------------
+// ---------------- Movement + Behavior ----------------
 function steerToward(agent, tx, ty, strength) {
   const angTo = Math.atan2(ty - agent.y, tx - agent.x);
   let da = angTo - agent.a;
@@ -572,14 +635,11 @@ function steerToward(agent, tx, ty, strength) {
   const tr = (0.05 + agent.g.turn * TURN_RATE_BASE) * strength;
   agent.a += clamp(da, -tr, tr);
 }
-
 function wander(agent) {
   agent.a += (Math.random() * 2 - 1) * (0.012 + (1 - agent.g.turn) * 0.035);
 }
-
 function move(agent) {
   const size = agent.g.size;
-
   const spBase = SPEED_MIN + agent.g.speed * (SPEED_MAX - SPEED_MIN);
   const sp = spBase * (1.12 - 0.55 * size);
 
@@ -602,20 +662,30 @@ function move(agent) {
 
 function grazerStep(g) {
   const vision = GRAZER_VISION * (0.85 + (1 - g.g.size) * 0.35);
-  let bestScore = -1, bestX = g.x, bestY = g.y;
+  let bestScore = -1,
+    bestX = g.x,
+    bestY = g.y;
 
   for (let i = 0; i < 8; i++) {
     const ang = g.a + (i - 3.5) * 0.35;
     const sx = g.x + Math.cos(ang) * vision;
     const sy = g.y + Math.sin(ang) * vision;
     const p = samplePlant((sx + W()) % W(), (sy + H()) % H());
-    if (p > bestScore) { bestScore = p; bestX = (sx + W()) % W(); bestY = (sy + H()) % H(); }
+    if (p > bestScore) {
+      bestScore = p;
+      bestX = (sx + W()) % W();
+      bestY = (sy + H()) % H();
+    }
   }
 
-  let nearestH = null, nd = Infinity;
+  let nearestH = null,
+    nd = Infinity;
   for (const h of hunters) {
     const d = dist2(g.x, g.y, h.x, h.y);
-    if (d < nd) { nd = d; nearestH = h; }
+    if (d < nd) {
+      nd = d;
+      nearestH = h;
+    }
   }
 
   const dangerDist = 46 + g.g.size * 8;
@@ -639,11 +709,15 @@ function grazerStep(g) {
 
 function hunterStep(h) {
   const vision = HUNTER_VISION * (0.9 + (1 - h.g.size) * 0.20);
-  let target = null, bestD = vision * vision;
+  let target = null,
+    bestD = vision * vision;
 
   for (const g of grazers) {
     const d = dist2(h.x, h.y, g.x, g.y);
-    if (d < bestD) { bestD = d; target = g; }
+    if (d < bestD) {
+      bestD = d;
+      target = g;
+    }
   }
 
   if (target) {
@@ -660,7 +734,8 @@ function hunterStep(h) {
     if (Math.random() < 0.60) wander(h);
   }
 
-  h.energy -= 0.00085 * (0.85 + h.g.size * 1.4) * (1 + densityPressure() * 1.2);
+  // slightly gentler drain so hunters survive better
+  h.energy -= 0.00070 * (0.85 + h.g.size * 1.4) * (1 + densityPressure() * 1.2);
   move(h);
 }
 
@@ -682,8 +757,11 @@ function handleLife(list) {
     if (a.reproCooldown > 0) continue;
     if (a.energy <= REPRO_THRESHOLD) continue;
 
-    if (a.type === "g") { if (!localPlantOk(a.x, a.y)) continue; }
-    else { if (!preyAbundant()) continue; }
+    if (a.type === "g") {
+      if (!localPlantOk(a.x, a.y)) continue;
+    } else {
+      if (!preyAbundant()) continue;
+    }
 
     const sizePenalty = 1 - a.g.size * 0.55;
     const p = baseChance * sizePenalty;
@@ -696,11 +774,37 @@ function handleLife(list) {
   }
 }
 
+// ---------------- NEW: Hunter from grazer baby every 60s ----------------
+function spawnHunterFromGrazerBaby() {
+  if (grazers.length === 0) return;
+
+  const parent = grazers[(Math.random() * grazers.length) | 0];
+  const ng = { ...parent.g };
+
+  // push “hunter-ish”
+  ng.bite = clamp(0.55 + ng.bite * 0.65 + Math.random() * 0.25, 0, 1);
+  ng.greed = clamp(0.30 + ng.greed * 0.35, 0, 1);
+  ng.caution = clamp(0.20 + ng.caution * 0.35, 0, 1);
+  ng.speed = clamp(ng.speed + 0.10 + (Math.random() * 0.10 - 0.05), 0, 1);
+  ng.size = clamp(ng.size + (Math.random() * 0.12 - 0.06), 0, 1);
+
+  const babySp = assignSpeciesAtBirth("h", geneVector(ng), null, ticks);
+
+  const baby = new Agent("h", parent.x + rand(14, -14), parent.y + rand(14, -14), ng, babySp);
+  baby.energy = 0.85;
+  baby.reproCooldown = REPRO_COOLDOWN_TICKS;
+
+  parent.energy = Math.max(0.20, parent.energy - 0.20);
+
+  hunters.push(baby);
+}
+
 // ---------------- Draw ----------------
 function clearFrame() {
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  const w = W(), h = H();
+  const w = W(),
+    h = H();
   if (!drawTrailsEl.checked) {
     ctx.fillStyle = "#06090d";
     ctx.fillRect(0, 0, w, h);
@@ -712,22 +816,26 @@ function clearFrame() {
 }
 
 function applyCameraTransform() {
-  const cx = W() / 2, cy = H() / 2;
+  const cx = W() / 2,
+    cy = H() / 2;
   ctx.translate(cx, cy);
   ctx.scale(cam.scale, cam.scale);
   ctx.translate(-cam.x, -cam.y);
 }
 
 function drawHeatmap() {
-  const w = W(), h = H();
-  const cellW = w / GRID, cellH = h / GRID;
-  for (let y = 0; y < GRID; y++) for (let x = 0; x < GRID; x++) {
-    const p = plant[idx(x, y)];
-    if (p <= 0.03) continue;
-    const v = Math.floor(26 + p * 120);
-    ctx.fillStyle = `rgb(18, ${v}, 40)`;
-    ctx.fillRect(x * cellW, y * cellH, cellW + 0.5, cellH + 0.5);
-  }
+  const w = W(),
+    h = H();
+  const cellW = w / GRID,
+    cellH = h / GRID;
+  for (let y = 0; y < GRID; y++)
+    for (let x = 0; x < GRID; x++) {
+      const p = plant[idx(x, y)];
+      if (p <= 0.03) continue;
+      const v = Math.floor(26 + p * 120);
+      ctx.fillStyle = `rgb(18, ${v}, 40)`;
+      ctx.fillRect(x * cellW, y * cellH, cellW + 0.5, cellH + 0.5);
+    }
 }
 
 function drawLabel(x, y, r, text) {
@@ -779,8 +887,12 @@ function draw() {
 }
 
 // ---------------- Save/Load ----------------
-function q(v) { return Math.floor(clamp(v, 0, 1) * 65535); }
-function uq(v) { return clamp(v / 65535, 0, 1); }
+function q16(v) {
+  return Math.floor(clamp(v, 0, 1) * 65535);
+}
+function uq16(v) {
+  return clamp(v / 65535, 0, 1);
+}
 
 function packPlants() {
   const out = new Uint16Array(plant.length);
@@ -795,8 +907,20 @@ function unpackPlants(arr) {
 
 function packAgent(a) {
   return [
-    a.type, a.x, a.y, a.a, a.energy, a.age, a.reproCooldown, a.speciesId ?? null,
-    q(a.g.speed), q(a.g.turn), q(a.g.greed), q(a.g.caution), q(a.g.bite), q(a.g.size)
+    a.type,
+    a.x,
+    a.y,
+    a.a,
+    a.energy,
+    a.age,
+    a.reproCooldown,
+    a.speciesId ?? null,
+    q16(a.g.speed),
+    q16(a.g.turn),
+    q16(a.g.greed),
+    q16(a.g.caution),
+    q16(a.g.bite),
+    q16(a.g.size),
   ];
 }
 function unpackAgent(row) {
@@ -806,7 +930,14 @@ function unpackAgent(row) {
   a.energy = row[4];
   a.age = row[5];
   a.reproCooldown = row[6];
-  a.g = { speed: uq(row[8]), turn: uq(row[9]), greed: uq(row[10]), caution: uq(row[11]), bite: uq(row[12]), size: uq(row[13]) };
+  a.g = {
+    speed: uq16(row[8]),
+    turn: uq16(row[9]),
+    greed: uq16(row[10]),
+    caution: uq16(row[11]),
+    bite: uq16(row[12]),
+    size: uq16(row[13]),
+  };
   return a;
 }
 
@@ -821,7 +952,15 @@ function unpackSpecies(arr) {
   speciesDB.clear();
   let maxId = 0;
   for (const row of arr) {
-    speciesDB.set(row[0], { id: row[0], type: row[1], name: row[2], color: row[3], count: row[4], centroid: row[5], createdTick: row[6] });
+    speciesDB.set(row[0], {
+      id: row[0],
+      type: row[1],
+      name: row[2],
+      color: row[3],
+      count: row[4],
+      centroid: row[5],
+      createdTick: row[6],
+    });
     if (row[0] > maxId) maxId = row[0];
   }
   nextSpeciesId = maxId + 1;
@@ -829,13 +968,14 @@ function unpackSpecies(arr) {
 
 function makeWorldPayload() {
   return {
-    version: 31,
+    version: 32,
     savedAt: Date.now(),
     ticks,
     frameCounter,
     cam: { ...cam },
     followedSpeciesId,
     legendMode,
+    lastHybridHunterSpawn,
     plant: packPlants(),
     species: packSpecies(),
     grazers: grazers.map(packAgent),
@@ -858,15 +998,18 @@ function resetWorldFresh() {
   ticks = 0;
   frameCounter = 0;
   paused = false;
+  lastHybridHunterSpawn = performance.now();
 
   resetPlants();
   initSpecies();
 
-  const gFirst = [...speciesDB.values()].find(s => s.type === "g")?.id ?? null;
-  const hFirst = [...speciesDB.values()].find(s => s.type === "h")?.id ?? null;
+  const gFirst = [...speciesDB.values()].find((s) => s.type === "g")?.id ?? null;
+  const hFirst = [...speciesDB.values()].find((s) => s.type === "h")?.id ?? null;
 
-  grazers = [new Agent("g", rand(W()), rand(H()), null, gFirst)];
-  hunters = [new Agent("h", rand(W()), rand(H()), null, hFirst)];
+  grazers = [];
+  hunters = [];
+  for (let i = 0; i < START_GRAZERS; i++) grazers.push(new Agent("g", rand(W()), rand(H()), null, gFirst));
+  for (let i = 0; i < START_HUNTERS; i++) hunters.push(new Agent("h", rand(W()), rand(H()), null, hFirst));
 
   resetView();
   followedSpeciesId = null;
@@ -878,14 +1021,14 @@ function resetWorldFresh() {
 }
 
 function applyWorldPayload(obj) {
-  if (!obj || obj.version !== 31) return false;
+  if (!obj || obj.version !== 32) return false;
 
   ticks = obj.ticks ?? 0;
   frameCounter = obj.frameCounter ?? 0;
 
   if (obj.cam) {
-    cam.x = obj.cam.x ?? (W() / 2);
-    cam.y = obj.cam.y ?? (H() / 2);
+    cam.x = obj.cam.x ?? W() / 2;
+    cam.y = obj.cam.y ?? H() / 2;
     cam.scale = obj.cam.scale ?? 1.0;
   } else {
     resetView();
@@ -893,14 +1036,17 @@ function applyWorldPayload(obj) {
 
   followedSpeciesId = obj.followedSpeciesId ?? null;
   legendMode = obj.legendMode ?? "g";
+  lastHybridHunterSpawn = obj.lastHybridHunterSpawn ?? performance.now();
 
-  if (obj.plant) unpackPlants(obj.plant); else resetPlants();
-  if (obj.species) unpackSpecies(obj.species); else initSpecies();
+  if (obj.plant) unpackPlants(obj.plant);
+  else resetPlants();
+
+  if (obj.species) unpackSpecies(obj.species);
+  else initSpecies();
 
   grazers = (obj.grazers ?? []).map(unpackAgent);
   hunters = (obj.hunters ?? []).map(unpackAgent);
 
-  // safety
   if (grazers.length === 0 || hunters.length === 0) resetWorldFresh();
 
   tabG.classList.toggle("active", legendMode === "g");
@@ -912,7 +1058,9 @@ function applyWorldPayload(obj) {
 
 function saveWorldToSlot() {
   if (!autosaveEl.checked) return;
-  try { localStorage.setItem(worldKey(), JSON.stringify(makeWorldPayload())); } catch {}
+  try {
+    localStorage.setItem(worldKey(), JSON.stringify(makeWorldPayload()));
+  } catch {}
 }
 
 function loadWorldFromSlot() {
@@ -946,8 +1094,10 @@ importFile.addEventListener("change", async () => {
       return;
     }
 
-    // save into this slot
-    try { localStorage.setItem(worldKey(), JSON.stringify(makeWorldPayload())); } catch {}
+    try {
+      localStorage.setItem(worldKey(), JSON.stringify(makeWorldPayload()));
+    } catch {}
+
     renderLegend();
     updateStatsText();
     importFile.value = "";
@@ -967,7 +1117,9 @@ slotSelect.addEventListener("change", () => {
 });
 
 clearSlotBtn.addEventListener("click", () => {
-  try { localStorage.removeItem(worldKey()); } catch {}
+  try {
+    localStorage.removeItem(worldKey());
+  } catch {}
   resetWorldFresh();
   renderLegend();
   updateStatsText();
@@ -996,16 +1148,15 @@ window.addEventListener("beforeunload", () => {
 
 // ---------------- Stats ----------------
 function updateStatsText() {
-  const avg = (arr, key) => arr.length ? (arr.reduce((s,a)=>s+a.g[key],0)/arr.length).toFixed(2) : "—";
-  const sizeAvg = (arr) => arr.length ? (arr.reduce((s,a)=>s+a.g.size,0)/arr.length).toFixed(2) : "—";
-  const livingSpecies = Array.from(speciesDB.values()).filter(s => s.count > 0).length;
+  const avg = (arr, key) => (arr.length ? (arr.reduce((s, a) => s + a.g[key], 0) / arr.length).toFixed(2) : "—");
+  const sizeAvg = (arr) => (arr.length ? (arr.reduce((s, a) => s + a.g.size, 0) / arr.length).toFixed(2) : "—");
+  const livingSpecies = Array.from(speciesDB.values()).filter((s) => s.count > 0).length;
 
-  statsEl.textContent =
-`Slot: ${currentSlot} | Ticks: ${ticks}
+  statsEl.textContent = `Slot: ${currentSlot} | Ticks: ${ticks}
 Grazers: ${grazers.length} | Hunters: ${hunters.length} | Living species: ${livingSpecies}
 Avg size: grazers ${sizeAvg(grazers)} | hunters ${sizeAvg(hunters)}
-Avg genes (grazers): speed ${avg(grazers,"speed")} greed ${avg(grazers,"greed")} caution ${avg(grazers,"caution")}
-Avg genes (hunters): speed ${avg(hunters,"speed")} bite  ${avg(hunters,"bite")}
+Avg genes (grazers): speed ${avg(grazers, "speed")} greed ${avg(grazers, "greed")} caution ${avg(grazers, "caution")}
+Avg genes (hunters): speed ${avg(hunters, "speed")} bite  ${avg(hunters, "bite")}
 Pressure: ${densityPressure().toFixed(2)} | Plant growth: ${settings.plantGrowth.toFixed(3)} | Mutation: ${settings.mutRate.toFixed(2)} / ${settings.mutStrength.toFixed(2)} | Speciation: ${settings.speciesSplit.toFixed(2)}
 Following species: ${followedSpeciesId ?? "—"}`;
 }
@@ -1025,9 +1176,19 @@ function tickOnce() {
 }
 
 function step() {
+  // NEW: force a hunter birth from a grazer baby every 60 seconds (real time)
+  const now = performance.now();
+  if (!paused && now - lastHybridHunterSpawn >= 60000) {
+    lastHybridHunterSpawn = now;
+    spawnHunterFromGrazerBaby();
+    renderLegend();
+    updateStatsText();
+    saveWorldToSlot();
+  }
+
   if (!paused) {
     frameCounter++;
-    const doTick = (frameCounter % settings.tickEvery === 0);
+    const doTick = frameCounter % settings.tickEvery === 0;
 
     if (doTick) {
       tickOnce();
@@ -1040,9 +1201,9 @@ function step() {
         renderLegend();
       }
 
-      const now = performance.now();
-      if (autosaveEl.checked && now - lastSaveTime > 2500) {
-        lastSaveTime = now;
+      const tnow = performance.now();
+      if (autosaveEl.checked && tnow - lastSaveTime > 2500) {
+        lastSaveTime = tnow;
         saveWorldToSlot();
         saveSettings();
       }
@@ -1057,7 +1218,6 @@ function step() {
 function start() {
   resetView();
 
-  // load current slot if possible
   if (!loadWorldFromSlot()) resetWorldFresh();
 
   updateSpeciesStats();
